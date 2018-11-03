@@ -352,10 +352,8 @@ struct RExC_state_t {
                                      }                                     \
                              } STMT_END
 
-/* Change from /d into /u rules, and restart the parse if we've already seen
- * something whose size would increase as a result, by setting *flagp and
- * returning 'restart_retval'.  RExC_uni_semantics is a flag that indicates
- * we've changed to /u during the parse.  */
+/* Change from /d into /u rules, and restart the parse.  RExC_uni_semantics is
+ * a flag that indicates we've changed to /u during the parse.  */
 #define REQUIRE_UNI_RULES(flagp, restart_retval)                            \
     STMT_START {                                                            \
             if (DEPENDS_SEMANTICS) {                                        \
@@ -7079,14 +7077,25 @@ S_set_regex_pv(pTHX_ RExC_state_t *pRExC_state, REGEXP *Rx)
  * pm_flags field of the related PMOP. Currently we're only interested in
  * PMf_HAS_CV, PMf_IS_QR, PMf_USE_RE_EVAL.
  *
- * We can't allocate space until we know how big the compiled form will be,
- * but we can't compile it (and thus know how big it is) until we've got a
- * place to put the code.  So we cheat:  we compile it twice, once with code
- * generation turned off and size counting turned on, and once "for real".
- * This also means that we don't allocate space until we are sure that the
- * thing really will compile successfully, and we never have to move the
- * code and thus invalidate pointers into it.  (Note that it has to be in
- * one piece because free() must be able to free it all.) [NB: not true in perl]
+ * For many years this code had an initial sizing pass that calculated
+ * (sometimes incorrectly, leading to security holes) the size needed for the
+ * compiled pattern.  That was changed by commit
+ * 7c932d07cab18751bfc7515b4320436273a459e2 in 5.29, which reallocs the size, a
+ * node at a time, as parsing goes along.  Patches welcome to fix any obsolete
+ * references to this sizing pass.
+ *
+ * Now, an initial crude guess as to the size needed is made, based on the
+ * length of the pattern.  Patches welcome to improve that guess.  That amount
+ * of space is malloc'd and then immediately freed, and then clawed back node
+ * by node.  This design is to minimze, to the extent possible, memory churn
+ * when doing the the reallocs.
+ *
+ * A separate parentheses counting pass may be needed in some cases.
+ * (Previously the sizing pass did this.)  Patches welcome to reduce the number
+ * of these cases.
+ *
+ * The existence of a sizing pass necessitated design decisions that are no
+ * longer needed.  There are potential areas of simplification.
  *
  * Beware that the optimization-preparation code in here knows about some
  * of the structure of the compiled regexp.  [I'll say.]
@@ -7334,9 +7343,7 @@ Perl_re_op_compile(pTHX_ SV ** const patternp, int pat_count,
 
     rx_flags = orig_rx_flags;
 
-    if (   initial_charset == REGEX_DEPENDS_CHARSET
-        && (RExC_uni_semantics))
-    {
+    if (initial_charset == REGEX_DEPENDS_CHARSET && RExC_uni_semantics) {
 
 	/* Set to use unicode semantics if the pattern is in utf8 and has the
 	 * 'depends' charset specified, as it means unicode when utf8  */
@@ -12480,7 +12487,7 @@ S_grok_bslash_N(pTHX_ RExC_state_t *pRExC_state,
   * function calling S_reg().
   *
   * The final possibility is that it is premature to be calling this function;
-  * that pass1 needs to be restarted.  This can happen when this changes from
+  * the parse needs to be restarted.  This can happen when this changes from
   * /d to /u rules, or when the pattern needs to be upgraded to UTF-8.  The
   * latter occurs only when the fourth possibility would otherwise be in
   * effect, and is because one of those code points requires the pattern to be
@@ -12813,8 +12820,7 @@ S_alloc_maybe_populate_EXACT(pTHX_ RExC_state_t *pRExC_state,
      *
      * If <len> is zero, the function assumes that the node is to contain only
      * the single character given by <code_point> and calculates what <len>
-     * should be.  In pass 1, it sizes the node appropriately.  In pass 2, it
-     * additionally will populate the node's STRING with <code_point> or its
+     * should be.  It populates the node's STRING with <code_point> or its
      * fold if folding.
      *
      * In both cases <*flagp> is appropriately set
@@ -13203,7 +13209,7 @@ S_regatom(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth)
 	/* Special Escapes
 
 	   This switch handles escape sequences that resolve to some kind
-	   of special regop and not to literal text. Escape sequnces that
+	   of special regop and not to literal text. Escape sequences that
 	   resolve to literal text are handled below in the switch marked
 	   "Literal Escapes".
 
@@ -13219,8 +13225,7 @@ S_regatom(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth)
 	    RExC_seen_zerolen++;
 	    ret = reg_node(pRExC_state, SBOL);
             /* SBOL is shared with /^/ so we set the flags so we can tell
-             * /\A/ from /^/ in split. We check ret because first pass we
-             * have no regop struct to set the flags on. */
+             * /\A/ from /^/ in split. */
             FLAGS(REGNODE_p(ret)) = 1;
 	    *flagp |= SIMPLE;
 	    goto finish_meta_pat;
@@ -13700,15 +13705,17 @@ S_regatom(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth)
             /* We start out as an EXACT node, even if under /i, until we find a
              * character which is in a fold.  The algorithm now segregates into
              * separate nodes, characters that fold from those that don't under
-             * /i.  (This hopefull will create nodes that are fixed strings
-             * even under /i, giving the optimizer something to grab onto to.)
+             * /i.  (This hopefully will create nodes that are fixed strings
+             * even under /i, giving the optimizer something to grab on to.)
              * So, if a node has something in it and the next character is in
              * the opposite category, that node is closed up, and the function
              * returns.  Then regatom is called again, and a new node is
              * created for the new category. */
             U8 node_type = EXACT;
 
-            /* Assume node will be fully used; the excess is given back at the end */
+            /* Assume the node will be fully used; the excess is given back at
+             * the end.  We can't make any other length assumptions, as a byte
+             * input sequence could shrink down. */
             Ptrdiff_t initial_size = STR_SZ(256);
 
             bool next_is_quantifier;
@@ -13722,8 +13729,7 @@ S_regatom(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth)
              * Similarly, we can convert EXACTFL nodes to EXACTFLU8 if they
              * contain only above-Latin1 characters (hence must be in UTF8),
              * which don't participate in folds with Latin1-range characters,
-             * as the latter's folds aren't known until runtime.  (We don't
-             * need to figure this out until pass 2) */
+             * as the latter's folds aren't known until runtime. */
             bool maybe_exactfu = TRUE;
 
             /* To see if RExC_uni_semantics changes during parsing of the node.
@@ -14120,19 +14126,14 @@ S_regatom(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth)
                     /* This code point means we can't simplify things */
                     maybe_exactfu = FALSE;
 
-                    /* A problematic code point in this context means that its
-                     * fold isn't known until runtime, so we can't fold it now.
-                     * (The non-problematic code points are the above-Latin1
-                     * ones that fold to also all above-Latin1.  Their folds
-                     * don't vary no matter what the locale is.) But here we
-                     * have characters whose fold depends on the locale.
-                     * Unlike the non-folding case above, we have to keep track
-                     * of these in the sizing pass, so that we can make sure we
-                     * don't split too-long nodes in the middle of a potential
-                     * multi-char fold.  And unlike the regular fold case
-                     * handled in the else clauses below, we don't actually
-                     * fold and don't have special cases to consider.  What we
-                     * do for both passes is the PASS2 code for non-folding */
+                    /* Here, we are adding a problematic fold character.
+                     * "Problematic" in this context means that its fold isn't
+                     * known until runtime.  (The non-problematic code points
+                     * are the above-Latin1 ones that fold to also all
+                     * above-Latin1.  Their folds don't vary no matter what the
+                     * locale is.) But here we have characters whose fold
+                     * depends on the locale.  We just add in the unfolded
+                     * character, and wait until runtime to fold it */
                     goto not_fold_common;
                 }
                 else                /* A regular FOLD code point */
@@ -14305,7 +14306,7 @@ S_regatom(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth)
                             added_len = foldlen;
                         }
                     }
-		}
+		} /* End of adding current character to the node */
 
                 len += added_len;
 
@@ -14479,6 +14480,7 @@ S_regatom(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth)
           loopdone:   /* Jumped to when encounters something that shouldn't be
                          in the node */
 
+            /* Free up any over-allocated space */
             change_engine_size(pRExC_state, - (initial_size - STR_SZ(len)));
 
             /* I (khw) don't know if you can get here with zero length, but the
@@ -14699,17 +14701,7 @@ S_handle_possible_posix(pTHX_ RExC_state_t *pRExC_state,
      * In b) there may be errors or warnings generated.  If 'check_only' is
      * TRUE, then any errors are discarded.  Warnings are returned to the
      * caller via an AV* created into '*posix_warnings' if it is not NULL.  If
-     * instead it is NULL, warnings are suppressed.  This is done in all
-     * passes.  The reason for this is that the rest of the parsing is heavily
-     * dependent on whether this routine found a valid posix class or not.  If
-     * it did, the closing ']' is absorbed as part of the class.  If no class,
-     * or an invalid one is found, any ']' will be considered the terminator of
-     * the outer bracketed character class, leading to very different results.
-     * In particular, a '(?[ ])' construct will likely have a syntax error if
-     * the class is parsed other than intended, and this will happen in pass1,
-     * before the warnings would normally be output.  This mechanism allows the
-     * caller to output those warnings in pass1 just before dieing, giving a
-     * much better clue as to what is wrong.
+     * instead it is NULL, warnings are suppressed.
      *
      * The reason for this function, and its complexity is that a bracketed
      * character class can contain just about anything.  But it's easy to
@@ -17274,11 +17266,9 @@ S_regclass(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth,
                 POSIXL_SET(posixl, namedclass);
 
                 /* The above-Latin1 characters are not subject to locale rules.
-                 * Just add them, in the second pass, to the
-                 * unconditionally-matched list */
+                 * Just add them to the unconditionally-matched list */
 
-                /* Get the list of the above-Latin1 code points this
-                    * matches */
+                /* Get the list of the above-Latin1 code points this matches */
                 _invlist_intersection_maybe_complement_2nd(PL_AboveLatin1,
                                         PL_XPosix_ptrs[classnum],
 
@@ -17286,10 +17276,10 @@ S_regclass(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth,
                                         * NDIGIT, NASCII, ... */
                                         namedclass % 2 != 0,
                                         &scratch_list);
-                /* Checking if 'cp_list' is NULL first saves an extra
-                    * clone.  Its reference count will be decremented at the
-                    * next union, etc, or if this is the only instance, at the
-                    * end of the routine */
+                /* Checking if 'cp_list' is NULL first saves an extra clone.
+                 * Its reference count will be decremented at the next union,
+                 * etc, or if this is the only instance, at the end of the
+                 * routine */
                 if (! cp_list) {
                     cp_list = scratch_list;
                 }
@@ -17301,10 +17291,8 @@ S_regclass(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth,
             }
             else {
 
-                /* Here, not in pass1 (in that pass we skip calculating the
-                 * contents of this class), and is not /l, or is a POSIX class
-                 * for which /l doesn't matter (or is a Unicode property, which
-                 * is skipped here). */
+                /* Here, is not /l, or is a POSIX class for which /l doesn't
+                 * matter (or is a Unicode property, which is skipped here). */
                 if (namedclass >= ANYOF_POSIXL_MAX) {  /* If a special class */
                     if (namedclass != ANYOF_UNIPROP) { /* UNIPROP = \p and \P */
 
@@ -17448,8 +17436,7 @@ S_regclass(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth,
          * <prevvalue> is the beginning of the range, if any; or <value> if
          * not. */
 
-	/* non-Latin1 code point implies unicode semantics.  Must be set in
-	 * pass1 so is there for the whole of pass 2 */
+	/* non-Latin1 code point implies unicode semantics. */
 	if (value > 255) {
             REQUIRE_UNI_RULES(flagp, 0);
 	}
@@ -18239,7 +18226,7 @@ S_regclass(pTHX_ RExC_state_t *pRExC_state, I32 *flagp, U32 depth,
                     /* Here, we are generally folding, but there is only one
                      * code point to match.  If we have to, we use an EXACT
                      * node, but it would be better for joining with adjacent
-                     * nodes in the optimization pass if we used the same
+                     * nodes in the optimization phase if we used the same
                      * EXACTFish node that any such are likely to be.  We can
                      * do this iff the code point doesn't participate in any
                      * folds.  For example, an EXACTF of a colon is the same as
@@ -19006,11 +18993,10 @@ S_change_engine_size(pTHX_ RExC_state_t *pRExC_state, const Ptrdiff_t size)
 STATIC regnode_offset
 S_regnode_guts(pTHX_ RExC_state_t *pRExC_state, const U8 op, const STRLEN extra_size, const char* const name)
 {
-    /* Allocate a regnode for 'op', with 'extra_size' extra space.  In pass1,
-     * it aligns and increments RExC_size; in pass2, RExC_emit
+    /* Allocate a regnode for 'op', with 'extra_size' extra space.  It aligns
+     * and increments RExC_size and RExC_emit
      *
-     * It returns the renode's offset into the regex engine program (meaningful
-     * only in pass2 */
+     * It returns the regnode's offset into the regex engine program */
 
     const regnode_offset ret = RExC_emit;
 
